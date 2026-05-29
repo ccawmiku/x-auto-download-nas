@@ -8,6 +8,7 @@
   "jitter_seconds": 2,
   "retry_failed": true,
   "max_download_attempts": 0,
+  "known_stop_consecutive": 10,
   "stop_marker": {
     "enabled": true,
     "url": "https://x.com/deskt3d/status/1992264334853165368?s=20"

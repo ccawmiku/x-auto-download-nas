@@ -49,6 +49,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "jitter_seconds": 2,
     "retry_failed": True,
     "max_download_attempts": 0,
+    "known_stop_consecutive": 10,
     "stop_marker": {
         "enabled": True,
         "url": "https://x.com/deskt3d/status/1992264334853165368?s=20",
@@ -247,6 +248,10 @@ class Store:
         with self.connect() as conn:
             return conn.execute("select * from tweets where tweet_id=?", (tweet_id,)).fetchone()
 
+    def is_done(self, tweet_id: str) -> bool:
+        row = self.get_tweet(tweet_id)
+        return bool(row and row["status"] == "done")
+
     def should_download(self, tweet_id: str, retry_failed: bool, max_attempts: int) -> bool:
         row = self.get_tweet(tweet_id)
         if not row:
@@ -403,9 +408,10 @@ class BrowserResult:
 
 
 class BrowserCollector:
-    def __init__(self, config: dict[str, Any], log: RingLog, progress: Any | None = None):
+    def __init__(self, config: dict[str, Any], log: RingLog, store: Store | None = None, progress: Any | None = None):
         self.config = config
         self.log = log
+        self.store = store
         self.progress = progress
 
     def _browser_executable(self) -> str | None:
@@ -484,10 +490,13 @@ class BrowserCollector:
         min_pixels = int(browser_cfg.get("scroll_pixels_min", 520))
         max_pixels = int(browser_cfg.get("scroll_pixels_max", 1120))
         pause_every = int(browser_cfg.get("pause_every_scrolls", 18) or 0)
+        known_stop = int(self.config.get("known_stop_consecutive", 10) or 0)
 
         seen: dict[str, dict[str, Any]] = {}
         ordered_ids: list[str] = []
         stop_found = False
+        consecutive_done = 0
+        known_stop_found = False
 
         async with async_playwright() as p:
             launch_kwargs: dict[str, Any] = {
@@ -538,10 +547,19 @@ class BrowserCollector:
                                 current["text"] = row.get("text", "")
                         if stop_id and tweet_id == stop_id:
                             stop_found = True
+                        if tweet_id not in seen or seen[tweet_id] is row:
+                            if self.store and self.store.is_done(tweet_id):
+                                consecutive_done += 1
+                            else:
+                                consecutive_done = 0
+                            if known_stop > 0 and consecutive_done >= known_stop:
+                                known_stop_found = True
 
                     new_count = len(seen) - before
                     if scroll % 5 == 0 or new_count:
-                        self.log.write(f"Likes scroll {scroll}: total={len(seen)}, new={new_count}")
+                        self.log.write(
+                            f"Likes scroll {scroll}: total={len(seen)}, new={new_count}, consecutive_done={consecutive_done}"
+                        )
                     if self.progress:
                         self.progress(
                             {
@@ -553,6 +571,9 @@ class BrowserCollector:
                         )
                     if stop_found:
                         self.log.write(f"Stop marker found: {stop_id}")
+                        break
+                    if known_stop_found:
+                        self.log.write(f"连续 {consecutive_done} 条已下载，停止继续向后翻")
                         break
                     if max_scrolls > 0 and scroll >= max_scrolls:
                         self.log.write(f"Reached max_scrolls={max_scrolls}")
@@ -884,7 +905,7 @@ class App:
         try:
             self.reload_config()
             self.log.write("Run started")
-            collector = BrowserCollector(self.config, self.log, self.set_progress)
+            collector = BrowserCollector(self.config, self.log, self.store, self.set_progress)
             result = asyncio.run(collector.collect())
             stats["discovered"] = len(result.tweets)
             self.set_progress(
@@ -1062,6 +1083,7 @@ def html_page(app: App) -> str:
           <div><label>停止标记 URL</label><input id="stopUrlInput" name="stop_url"></div>
           <div><label>运行间隔（小时）</label><input id="intervalHoursInput" name="interval_hours" type="number" min="0.1" step="0.1"></div>
           <div><label>最大滚动次数（0 表示直到标记或页面无新增）</label><input id="maxScrollsInput" name="max_scrolls" type="number" min="0" step="1"></div>
+          <div><label>连续已下载停止数</label><input id="knownStopInput" name="known_stop_consecutive" type="number" min="0" step="1"></div>
         </div>
         <div class="actions"><button type="submit">保存配置</button></div>
       </form>
@@ -1125,6 +1147,7 @@ def html_page(app: App) -> str:
       $("stopUrlInput").value = cfg.stop_marker?.url || "";
       $("intervalHoursInput").value = data.run_interval_hours || cfg.run_interval_hours || 12;
       $("maxScrollsInput").value = cfg.browser?.max_scrolls || 0;
+      $("knownStopInput").value = cfg.known_stop_consecutive || 10;
       filledForm = true;
     }
     async function refreshStatus() {
@@ -1203,6 +1226,7 @@ def make_handler(app: App):
                 patch = {
                     "run_interval_hours": hours,
                     "run_interval_seconds": int(hours * 3600),
+                    "known_stop_consecutive": int((form.get("known_stop_consecutive") or ["10"])[0] or 10),
                     "stop_marker": {"url": (form.get("stop_url") or [""])[0]},
                     "browser": {
                         "likes_url": (form.get("likes_url") or [""])[0],
