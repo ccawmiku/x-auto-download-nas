@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   x-auto-downloader:
-    build: .
+    image: ghcr.io/ccawmiku/x-auto-download-nas:latest
     container_name: x-auto-downloader
     ports:
       - "13003:8080"
@@ -14,7 +14,5 @@ services:
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
     command: >
-      sh -c "python -c 'from playwright.async_api import async_playwright' 2>/dev/null
-      || python -m pip install --no-cache-dir -r /app/requirements.txt;
-      python /app/x_auto_worker.py --config /config/config.json"
+      sh -c "python /app/x_auto_worker.py --config /config/config.json"
     restart: unless-stopped
