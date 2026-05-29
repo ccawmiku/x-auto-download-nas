@@ -1,0 +1,48 @@
+{
+  "run_interval_seconds": 43200,
+  "database": "/state/x_auto.sqlite3",
+  "cookie_file": "/config/x_cookies.txt",
+  "download_dir": "/downloads",
+  "default_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  "request_delay_seconds": 3,
+  "jitter_seconds": 2,
+  "retry_failed": true,
+  "max_download_attempts": 0,
+  "stop_marker": {
+    "enabled": true,
+    "url": "https://x.com/deskt3d/status/1992264334853165368?s=20"
+  },
+  "browser": {
+    "enabled": true,
+    "headless": true,
+    "likes_url": "",
+    "scroll_delay_min_ms": 1500,
+    "scroll_delay_max_ms": 4000,
+    "scroll_pixels_min": 520,
+    "scroll_pixels_max": 1120,
+    "pause_every_scrolls": 18,
+    "pause_min_seconds": 10,
+    "pause_max_seconds": 30,
+    "max_scrolls": 0,
+    "max_idle_scrolls": 30,
+    "target_timeout_ms": 45000
+  },
+  "media": {
+    "video_format": "bv*+ba/b",
+    "convert_gif": false,
+    "image_candidates": [
+      "{media_id}.png?name=4096x4096",
+      "{media_id}.jpg?name=4096x4096",
+      "{media_id}?format=png&name=4096x4096",
+      "{media_id}?format=jpg&name=orig",
+      "{media_id}?format=jpg&name=4096x4096",
+      "{media_id}.jpg?name=orig"
+    ]
+  },
+  "web": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8080,
+    "log_lines": 300
+  }
+}
