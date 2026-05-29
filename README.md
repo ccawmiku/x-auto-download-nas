@@ -19,10 +19,10 @@ GitHub 仓库 -> Actions -> Docker Image CI
 等待任务成功，镜像会发布到：
 
 ```text
-ghcr.io/ccawmiku/x-auto-download-nas:1.0.0
+ghcr.io/ccawmiku/x-auto-download-nas:1.0.1
 ```
 
-这里不用 `latest`，compose 也固定使用 `1.0.0`。以后升级时，把 workflow 和 compose 里的版本号一起改成 `1.0.1`、`1.0.2` 这类版本。
+这里不用 `latest`，compose 固定使用明确版本。以后升级时，先改 `docker-compose.yml` 里的镜像版本，再打对应 git tag，例如 `v1.0.2`。
 
 如果 GHCR package 是 private，NAS 拉镜像前需要登录：
 
