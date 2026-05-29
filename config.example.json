@@ -25,7 +25,10 @@
     "pause_max_seconds": 30,
     "max_scrolls": 0,
     "max_idle_scrolls": 30,
-    "target_timeout_ms": 45000
+    "target_timeout_ms": 45000,
+    "screenshot_enabled": false,
+    "screenshot_full_page": false,
+    "screenshot_timeout_ms": 10000
   },
   "media": {
     "video_format": "bv*+ba/b",

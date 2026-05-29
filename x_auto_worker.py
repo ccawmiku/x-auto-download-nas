@@ -67,6 +67,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_scrolls": 0,
         "max_idle_scrolls": 30,
         "target_timeout_ms": 45000,
+        "screenshot_enabled": False,
+        "screenshot_full_page": False,
+        "screenshot_timeout_ms": 10000,
     },
     "media": {
         "video_format": "bv*+ba/b",
@@ -569,8 +572,17 @@ class BrowserCollector:
                         self.log.write(f"Human-like pause: {pause}s")
                         await page.wait_for_timeout(pause * 1000)
 
-                screenshot = str(out_dir / "last_likes_page.png")
-                await page.screenshot(path=screenshot, full_page=True)
+                screenshot = ""
+                if bool(browser_cfg.get("screenshot_enabled", False)):
+                    screenshot = str(out_dir / "last_likes_page.png")
+                    try:
+                        await page.screenshot(
+                            path=screenshot,
+                            full_page=bool(browser_cfg.get("screenshot_full_page", False)),
+                            timeout=int(browser_cfg.get("screenshot_timeout_ms", 10000)),
+                        )
+                    except Exception as error:
+                        self.log.write(f"截图失败，已跳过，不影响下载：{error}")
             finally:
                 await context.close()
                 await browser.close()
