@@ -35,6 +35,7 @@ MEDIA_ID_RE = re.compile(r"/media/([^?./]+)(?:\.[a-zA-Z0-9]+)?")
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "run_interval_hours": 12,
     "run_interval_seconds": 43200,
     "database": "/state/x_auto.sqlite3",
     "cookie_file": "/config/x_cookies.txt",
@@ -103,8 +104,23 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def tweet_id_from_url(url: str) -> str:
-    match = re.search(r"/status/(\d+)", url)
+    value = str(url or "").strip()
+    if value.isdigit():
+        return value
+    match = re.search(r"/status/(\d+)", value)
     return match.group(1) if match else ""
+
+
+def interval_hours(config: dict[str, Any]) -> float:
+    if "run_interval_hours" in config:
+        try:
+            return max(0.01, float(config.get("run_interval_hours") or 12))
+        except (TypeError, ValueError):
+            return 12.0
+    try:
+        return max(0.01, float(config.get("run_interval_seconds", 43200)) / 3600)
+    except (TypeError, ValueError):
+        return 12.0
 
 
 class RingLog:
@@ -384,9 +400,10 @@ class BrowserResult:
 
 
 class BrowserCollector:
-    def __init__(self, config: dict[str, Any], log: RingLog):
+    def __init__(self, config: dict[str, Any], log: RingLog, progress: Any | None = None):
         self.config = config
         self.log = log
+        self.progress = progress
 
     def _browser_executable(self) -> str | None:
         env = os.environ.get("CHROME_PATH")
@@ -522,6 +539,15 @@ class BrowserCollector:
                     new_count = len(seen) - before
                     if scroll % 5 == 0 or new_count:
                         self.log.write(f"Likes scroll {scroll}: total={len(seen)}, new={new_count}")
+                    if self.progress:
+                        self.progress(
+                            {
+                                "phase": "collecting",
+                                "collected": len(seen),
+                                "scroll": scroll,
+                                "new_on_last_scroll": new_count,
+                            }
+                        )
                     if stop_found:
                         self.log.write(f"Stop marker found: {stop_id}")
                         break
@@ -797,6 +823,33 @@ class App:
         self.last_run_message = ""
         self.next_run_at = 0.0
         self.stop_event = threading.Event()
+        self.progress_lock = threading.Lock()
+        self.progress: dict[str, Any] = self._empty_progress()
+
+    def _empty_progress(self) -> dict[str, Any]:
+        return {
+            "phase": "idle",
+            "collected": 0,
+            "scroll": 0,
+            "new_on_last_scroll": 0,
+            "download_total": 0,
+            "download_done": 0,
+            "downloaded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "images": 0,
+            "gifs": 0,
+            "videos": 0,
+            "current_url": "",
+        }
+
+    def set_progress(self, patch: dict[str, Any]) -> None:
+        with self.progress_lock:
+            self.progress.update(patch)
+
+    def get_progress(self) -> dict[str, Any]:
+        with self.progress_lock:
+            return dict(self.progress)
 
     def reload_config(self) -> None:
         self.config = load_config(self.config_path)
@@ -810,15 +863,26 @@ class App:
         if not self.run_lock.acquire(blocking=False):
             raise RuntimeError("a run is already active")
         self.running = True
+        with self.progress_lock:
+            self.progress = self._empty_progress()
+            self.progress["phase"] = "starting"
         run_id = self.store.begin_run()
         stats = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
         message = ""
         try:
             self.reload_config()
             self.log.write("Run started")
-            collector = BrowserCollector(self.config, self.log)
+            collector = BrowserCollector(self.config, self.log, self.set_progress)
             result = asyncio.run(collector.collect())
             stats["discovered"] = len(result.tweets)
+            self.set_progress(
+                {
+                    "phase": "downloading",
+                    "download_total": len(result.tweets),
+                    "download_done": 0,
+                    "collected": len(result.tweets),
+                }
+            )
             self.log.write(
                 f"Collected {len(result.tweets)} liked tweet(s); stop_found={result.stop_found}"
             )
@@ -826,6 +890,7 @@ class App:
             delay = float(self.config.get("request_delay_seconds", 3))
             jitter = float(self.config.get("jitter_seconds", 2))
             for index, item in enumerate(result.tweets, start=1):
+                self.set_progress({"phase": "downloading", "current_url": item["url"]})
                 status, files, error = downloader.download_item(item)
                 if status == "done":
                     stats["downloaded"] += 1
@@ -834,11 +899,25 @@ class App:
                 else:
                     stats["failed"] += 1
                     self.log.write(f"Failed {item['url']}: {error}")
+                media_counts = self._count_media_files(files)
+                current = self.get_progress()
+                self.set_progress(
+                    {
+                        "download_done": index,
+                        "downloaded": stats["downloaded"],
+                        "skipped": stats["skipped"],
+                        "failed": stats["failed"],
+                        "images": int(current.get("images", 0)) + media_counts["images"],
+                        "gifs": int(current.get("gifs", 0)) + media_counts["gifs"],
+                        "videos": int(current.get("videos", 0)) + media_counts["videos"],
+                    }
+                )
                 self.log.write(f"Progress {index}/{len(result.tweets)}: {status} {item['url']}")
                 sleep_for = delay + random.random() * jitter
                 if sleep_for > 0 and index < len(result.tweets):
                     time.sleep(sleep_for)
             message = "ok"
+            self.set_progress({"phase": "finished", "current_url": ""})
             self.store.finish_run(run_id, "done", stats, message)
             self.log.write(f"Run finished: {stats}")
             return stats
@@ -846,12 +925,28 @@ class App:
             message = str(error)
             self.log.write(f"Run failed: {message}")
             self.log.write(traceback.format_exc())
+            self.set_progress({"phase": "failed", "current_url": "", "failed": stats["failed"]})
             self.store.finish_run(run_id, "failed", stats, message)
             raise
         finally:
             self.last_run_message = message
             self.running = False
             self.run_lock.release()
+
+    def _count_media_files(self, files: list[str]) -> dict[str, int]:
+        counts = {"images": 0, "gifs": 0, "videos": 0}
+        for file in files:
+            path = Path(file)
+            suffix = path.suffix.lower()
+            parts = {part.lower() for part in path.parts}
+            if suffix == ".gif":
+                counts["gifs"] += 1
+                counts["images"] += 1
+            elif "images" in parts or suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+                counts["images"] += 1
+            elif "videos" in parts or suffix in {".mp4", ".mkv", ".webm"}:
+                counts["videos"] += 1
+        return counts
 
     def start_run_thread(self) -> None:
         def target() -> None:
@@ -865,7 +960,7 @@ class App:
     def scheduler_loop(self) -> None:
         while not self.stop_event.is_set():
             self.reload_config()
-            interval = int(self.config.get("run_interval_seconds", 43200))
+            interval = int(interval_hours(self.config) * 3600)
             if self.next_run_at <= 0:
                 self.next_run_at = time.time() + 5
             if time.time() >= self.next_run_at and not self.running:
@@ -884,73 +979,77 @@ class App:
             "tweets": self.store.recent_tweets(),
             "logs": self.log.lines(),
             "last_run_message": self.last_run_message,
+            "progress": self.get_progress(),
+            "run_interval_hours": interval_hours(self.config),
         }
 
 
 def html_page(app: App) -> str:
-    status = app.status()
-    cfg = status["config"]
-    logs = "\n".join(html.escape(line) for line in status["logs"])
-    runs = status["runs"]
-    tweets = status["tweets"]
-    run_rows = "".join(
-        f"<tr><td>{r['id']}</td><td>{html.escape(r['started_at'])}</td><td>{html.escape(str(r['status']))}</td>"
-        f"<td>{r['discovered']}</td><td>{r['downloaded']}</td><td>{r['skipped']}</td><td>{r['failed']}</td></tr>"
-        for r in runs
-    )
-    tweet_rows = "".join(
-        f"<tr><td><a href='{html.escape(t['url'])}' target='_blank'>{html.escape(t['tweet_id'])}</a></td>"
-        f"<td>{html.escape(t.get('author') or '')}</td><td>{html.escape(t.get('media_hint') or '')}</td>"
-        f"<td>{html.escape(t.get('status') or '')}</td><td>{t.get('attempts')}</td>"
-        f"<td>{html.escape((t.get('error') or '')[:120])}</td></tr>"
-        for t in tweets
-    )
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{APP_NAME}</title>
+  <title>__APP_NAME__</title>
   <style>
-    :root {{ color-scheme: light; --bg:#f6f7f9; --panel:#fff; --line:#d9dde5; --text:#1d2433; --muted:#657084; --accent:#111827; }}
-    body {{ margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }}
-    header {{ height:56px; display:flex; align-items:center; justify-content:space-between; padding:0 24px; background:#111827; color:white; }}
-    main {{ max-width:1180px; margin:0 auto; padding:20px; display:grid; gap:16px; }}
-    section {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }}
-    h1 {{ font-size:18px; margin:0; }} h2 {{ font-size:16px; margin:0 0 12px; }}
-    label {{ display:block; color:var(--muted); font-size:13px; margin:10px 0 5px; }}
-    input, textarea {{ width:100%; box-sizing:border-box; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; background:white; }}
-    textarea {{ min-height:110px; resize:vertical; }}
-    button {{ border:0; background:var(--accent); color:white; border-radius:6px; padding:9px 14px; cursor:pointer; }}
-    button.secondary {{ background:#475569; }} button.danger {{ background:#b91c1c; }}
-    .grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }}
-    .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
-    .pill {{ display:inline-flex; align-items:center; padding:3px 8px; border-radius:999px; background:#e6edf6; font-size:12px; color:#334155; }}
-    table {{ width:100%; border-collapse:collapse; font-size:13px; }} th,td {{ border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }}
-    pre {{ margin:0; background:#0f172a; color:#dbeafe; padding:12px; border-radius:6px; overflow:auto; max-height:360px; }}
-    .muted {{ color:var(--muted); }} .status {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-    @media (max-width:760px) {{ .grid {{ grid-template-columns:1fr; }} header {{ padding:0 14px; }} main {{ padding:12px; }} }}
+    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --line:#d9dde5; --text:#1d2433; --muted:#657084; --accent:#111827; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+    header { height:56px; display:flex; align-items:center; justify-content:space-between; padding:0 24px; background:#111827; color:white; }
+    main { max-width:1180px; margin:0 auto; padding:20px; display:grid; gap:16px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    h1 { font-size:18px; margin:0; } h2 { font-size:16px; margin:0 0 12px; }
+    label { display:block; color:var(--muted); font-size:13px; margin:10px 0 5px; }
+    input, textarea { width:100%; box-sizing:border-box; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; background:white; }
+    textarea { min-height:120px; resize:vertical; }
+    button { border:0; background:var(--accent); color:white; border-radius:6px; padding:9px 14px; cursor:pointer; }
+    button.secondary { background:#475569; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .pill { display:inline-flex; align-items:center; padding:3px 8px; border-radius:999px; background:#e6edf6; font-size:12px; color:#334155; }
+    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
+    pre { margin:0; background:#0f172a; color:#dbeafe; padding:12px; border-radius:6px; overflow:auto; max-height:520px; white-space:pre-wrap; }
+    progress { width:100%; height:16px; accent-color:#111827; }
+    .progress-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:12px; }
+    .metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fbfcfe; }
+    .metric strong { display:block; font-size:18px; margin-top:4px; }
+    .help { color:var(--muted); font-size:13px; line-height:1.65; }
+    .muted { color:var(--muted); } .status { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    @media (max-width:760px) { .grid,.progress-grid { grid-template-columns:1fr; } header { padding:0 14px; } main { padding:12px; } }
   </style>
 </head>
 <body>
-  <header><h1>X Auto Downloader</h1><div class="status"><span class="pill">Running: {status['running']}</span><span class="pill">Cookie: {status['cookie_present']}</span></div></header>
+  <header><h1>X Auto Downloader</h1><div class="status"><span id="runningPill" class="pill">运行状态：读取中</span><span id="cookiePill" class="pill">Cookie：读取中</span></div></header>
   <main>
     <section>
       <h2>控制</h2>
-      <div class="muted">下一次自动运行：{html.escape(status['next_run_at']) or '未排程'}；周期：{cfg.get('run_interval_seconds')} 秒</div>
+      <div class="muted" id="scheduleText">正在读取状态...</div>
       <div class="actions">
         <form method="post" action="/run"><button type="submit">立即运行</button></form>
         <form method="post" action="/reload"><button class="secondary" type="submit">重新读取配置</button></form>
       </div>
     </section>
     <section>
+      <h2>运行进度</h2>
+      <div class="muted" id="phaseText">等待中</div>
+      <div class="muted">下载方式：单线程顺序下载，不并发；每条推文处理完后才会处理下一条。</div>
+      <label>下载总进度</label>
+      <progress id="totalProgress" value="0" max="1"></progress>
+      <div class="progress-grid">
+        <div class="metric">已采集推文<strong id="collectedMetric">0</strong></div>
+        <div class="metric">已下载/总数<strong id="downloadMetric">0 / 0</strong></div>
+        <div class="metric">图片/GIF<strong id="imageMetric">0 / 0</strong></div>
+        <div class="metric">视频<strong id="videoMetric">0</strong></div>
+      </div>
+      <div class="muted" id="currentUrl"></div>
+    </section>
+    <section>
       <h2>配置</h2>
       <form method="post" action="/settings">
         <div class="grid">
-          <div><label>Likes 页面 URL（留空自动用当前账号）</label><input name="likes_url" value="{html.escape(str(cfg['browser'].get('likes_url','')))}"></div>
-          <div><label>停止标记 URL</label><input name="stop_url" value="{html.escape(str(cfg['stop_marker'].get('url','')))}"></div>
-          <div><label>运行间隔（秒）</label><input name="interval" value="{html.escape(str(cfg.get('run_interval_seconds')))}"></div>
-          <div><label>最大滚动次数（0 表示直到标记或页面无新增）</label><input name="max_scrolls" value="{html.escape(str(cfg['browser'].get('max_scrolls',0)))}"></div>
+          <div><label>Likes 页面 URL（留空自动使用当前账号）</label><input id="likesUrlInput" name="likes_url"></div>
+          <div><label>停止标记 URL</label><input id="stopUrlInput" name="stop_url"></div>
+          <div><label>运行间隔（小时）</label><input id="intervalHoursInput" name="interval_hours" type="number" min="0.1" step="0.1"></div>
+          <div><label>最大滚动次数（0 表示直到标记或页面无新增）</label><input id="maxScrollsInput" name="max_scrolls" type="number" min="0" step="1"></div>
         </div>
         <div class="actions"><button type="submit">保存配置</button></div>
       </form>
@@ -958,26 +1057,87 @@ def html_page(app: App) -> str:
     <section>
       <h2>Cookie</h2>
       <form method="post" action="/cookie">
-        <label>粘贴 cookies.txt 内容；也支持一行 Cookie header</label>
+        <div class="help">
+          推荐用浏览器扩展导出 X/Twitter 的 Netscape 格式 cookies.txt。打开 x.com 并保持登录，点击类似 “Get cookies.txt LOCALLY” 的扩展，选择导出当前站点 cookies.txt。<br>
+          也支持直接粘贴浏览器开发者工具里复制出来的一行 Cookie header。保存后程序会写入 <code>/config/x_cookies.txt</code>。
+        </div>
+        <label>粘贴 cookies.txt 内容或一行 Cookie header</label>
         <textarea name="cookie_text" placeholder="# Netscape HTTP Cookie File..."></textarea>
         <div class="actions"><button type="submit">保存 Cookie</button></div>
       </form>
     </section>
     <section>
       <h2>最近运行</h2>
-      <table><thead><tr><th>ID</th><th>开始</th><th>状态</th><th>发现</th><th>下载</th><th>跳过</th><th>失败</th></tr></thead><tbody>{run_rows}</tbody></table>
+      <table><thead><tr><th>ID</th><th>开始</th><th>状态</th><th>发现</th><th>下载</th><th>跳过</th><th>失败</th></tr></thead><tbody id="runsBody"></tbody></table>
     </section>
     <section>
       <h2>下载记录</h2>
-      <table><thead><tr><th>Tweet</th><th>作者</th><th>类型</th><th>状态</th><th>次数</th><th>错误</th></tr></thead><tbody>{tweet_rows}</tbody></table>
+      <table><thead><tr><th>Tweet</th><th>作者</th><th>类型</th><th>状态</th><th>次数</th><th>错误</th></tr></thead><tbody id="tweetsBody"></tbody></table>
     </section>
     <section>
       <h2>日志</h2>
-      <pre>{logs}</pre>
+      <pre id="logBox"></pre>
     </section>
   </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    let filledForm = false;
+    function phaseName(phase) {
+      return {idle:"空闲", starting:"准备运行", collecting:"正在滚动采集 Likes", downloading:"正在下载媒体", finished:"已完成", failed:"运行失败"}[phase] || phase || "未知";
+    }
+    function updateProgress(progress) {
+      const total = Number(progress.download_total || 0);
+      const done = Number(progress.download_done || 0);
+      $("phaseText").textContent = `阶段：${phaseName(progress.phase)}；滚动：${progress.scroll || 0}；本次新增：${progress.new_on_last_scroll || 0}`;
+      $("totalProgress").max = total > 0 ? total : 1;
+      $("totalProgress").value = total > 0 ? done : 0;
+      $("collectedMetric").textContent = progress.collected || 0;
+      $("downloadMetric").textContent = `${done} / ${total}`;
+      $("imageMetric").textContent = `${progress.images || 0} / ${progress.gifs || 0}`;
+      $("videoMetric").textContent = progress.videos || 0;
+      $("currentUrl").textContent = progress.current_url ? `当前：${progress.current_url}` : "";
+    }
+    function updateTables(data) {
+      $("runsBody").innerHTML = (data.runs || []).map((r) =>
+        `<tr><td>${r.id}</td><td>${esc(r.started_at)}</td><td>${esc(r.status)}</td><td>${r.discovered}</td><td>${r.downloaded}</td><td>${r.skipped}</td><td>${r.failed}</td></tr>`
+      ).join("");
+      $("tweetsBody").innerHTML = (data.tweets || []).map((t) =>
+        `<tr><td><a href="${esc(t.url)}" target="_blank">${esc(t.tweet_id)}</a></td><td>${esc(t.author)}</td><td>${esc(t.media_hint)}</td><td>${esc(t.status)}</td><td>${esc(t.attempts)}</td><td>${esc((t.error || "").slice(0, 120))}</td></tr>`
+      ).join("");
+    }
+    function fillFormOnce(data) {
+      if (filledForm) return;
+      const cfg = data.config || {};
+      $("likesUrlInput").value = cfg.browser?.likes_url || "";
+      $("stopUrlInput").value = cfg.stop_marker?.url || "";
+      $("intervalHoursInput").value = data.run_interval_hours || cfg.run_interval_hours || 12;
+      $("maxScrollsInput").value = cfg.browser?.max_scrolls || 0;
+      filledForm = true;
+    }
+    async function refreshStatus() {
+      try {
+        const res = await fetch("/api/status", {cache: "no-store"});
+        const data = await res.json();
+        $("runningPill").textContent = `运行状态：${data.running ? "运行中" : "空闲"}`;
+        $("cookiePill").textContent = `Cookie：${data.cookie_present ? "已保存" : "未保存"}`;
+        $("scheduleText").textContent = `下一次自动运行：${data.next_run_at || "未排程"}；周期：${data.run_interval_hours || 12} 小时`;
+        updateProgress(data.progress || {});
+        updateTables(data);
+        const logBox = $("logBox");
+        const shouldStick = Math.abs(logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight) < 40;
+        logBox.textContent = (data.logs || []).join("\\n");
+        if (shouldStick) logBox.scrollTop = logBox.scrollHeight;
+        fillFormOnce(data);
+      } catch (error) {
+        $("scheduleText").textContent = `状态刷新失败：${error}`;
+      }
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+  </script>
 </body>
-</html>"""
+</html>""".replace("__APP_NAME__", APP_NAME)
 
 
 def redirect(handler: BaseHTTPRequestHandler, location: str = "/") -> None:
@@ -1019,12 +1179,18 @@ def make_handler(app: App):
             if self.path == "/cookie":
                 cookie_text = (form.get("cookie_text") or [""])[0]
                 write_cookie_file(Path(app.config["cookie_file"]), cookie_text)
-                app.log.write("Cookie saved from web UI")
+                app.log.write("已从网页端保存 Cookie")
                 redirect(self)
                 return
             if self.path == "/settings":
+                hours_raw = (form.get("interval_hours") or ["12"])[0] or "12"
+                try:
+                    hours = max(0.1, float(hours_raw))
+                except ValueError:
+                    hours = 12.0
                 patch = {
-                    "run_interval_seconds": int((form.get("interval") or ["43200"])[0] or 43200),
+                    "run_interval_hours": hours,
+                    "run_interval_seconds": int(hours * 3600),
                     "stop_marker": {"url": (form.get("stop_url") or [""])[0]},
                     "browser": {
                         "likes_url": (form.get("likes_url") or [""])[0],
@@ -1032,7 +1198,7 @@ def make_handler(app: App):
                     },
                 }
                 app.save_config(patch)
-                app.log.write("Settings saved from web UI")
+                app.log.write("已从网页端保存设置")
                 redirect(self)
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
