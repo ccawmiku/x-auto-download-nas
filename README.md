@@ -2,74 +2,119 @@
 
 基于 `Playwright + yt-dlp` 的 X 点赞媒体自动下载器，目标是在 NAS Docker 上低频运行。
 
-## 功能
+## 生成 Docker 镜像
 
-- 网页端管理配置和 cookie。
-- 用无头浏览器打开 X likes 页面并滚动收集推文链接。
-- 遇到停止标记推文后停止继续向下采集。
-- SQLite 记录已发现和已下载推文，避免重复下载。
-- 图片优先尝试高质量 CDN 候选：
-  - `{media_id}.png?name=4096x4096`
-  - `{media_id}.jpg?name=4096x4096`
-  - `?format=jpg&name=orig`
-- 视频使用 `yt-dlp -f "bv*+ba/b"` 下载最高可用版本。
-- X 动图先用 `yt-dlp` 获取最高 mp4，再默认转成 GIF，按图片归类。
-- 默认 12 小时运行一次，单线程、随机滚动等待、无并发。
+仓库包含 GitHub Actions：
+
+```text
+.github/workflows/docker-image.yml
+```
+
+把代码 push 到 `main` 后，进入：
+
+```text
+GitHub 仓库 -> Actions -> Docker Image CI
+```
+
+等待任务成功，镜像会发布到：
+
+```text
+ghcr.io/ccawmiku/x-auto-download-nas:1.0.0
+```
+
+这里不用 `latest`，compose 也固定使用 `1.0.0`。以后升级时，把 workflow 和 compose 里的版本号一起改成 `1.0.1`、`1.0.2` 这类版本。
+
+如果 GHCR package 是 private，NAS 拉镜像前需要登录：
+
+```bash
+docker login ghcr.io -u ccawmiku
+```
+
+密码使用 GitHub Personal Access Token，不是 GitHub 登录密码。
 
 ## NAS 部署
 
-先在 NAS 上创建目录：
+先创建目录：
 
 ```bash
-mkdir -p /volume1/docker/x-auto-download/config
-mkdir -p /volume1/docker/x-auto-download/state
-mkdir -p /volume1/docker/x-auto-download/downloads
+mkdir -p /volume2/docker/x-auto-download/config
+mkdir -p /volume2/docker/x-auto-download/state
+mkdir -p /volume2/docker/x-auto-download/downloads-metadata
+mkdir -p /volume2/docker/x-auto-download/images
+mkdir -p /volume2/docker/x-auto-download/videos
+mkdir -p /volume2/docker/x-auto-download-app
 ```
 
-从 GitHub 拉取后运行：
+把 `docker-compose.yml` 放到：
+
+```text
+/volume2/docker/x-auto-download-app/docker-compose.yml
+```
+
+启动：
 
 ```bash
-cd /volume1/docker
-git clone https://github.com/你的用户名/你的仓库名.git x-auto-download-app
-cd x-auto-download-app
-docker compose up -d --build
+cd /volume2/docker/x-auto-download-app
+docker compose pull
+docker compose up -d
 ```
 
-如果已经 clone 过，更新代码：
-
-```bash
-cd /volume1/docker/x-auto-download-app
-git pull
-docker compose up -d --build
-```
-
-网页端默认端口：
+网页端：
 
 ```text
 http://NAS_IP:13003
 ```
 
-`docker-compose.yml` 使用了 `command: >`，适配不支持复杂数组 command 的 NAS 面板。
+## 下载目录结构
+
+`docker-compose.yml` 默认挂载：
+
+```yaml
+volumes:
+  - /volume2/docker/x-auto-download/config:/config
+  - /volume2/docker/x-auto-download/state:/state
+  - /volume2/docker/x-auto-download/downloads-metadata:/downloads
+  - /volume2/docker/x-auto-download/images:/downloads/images
+  - /volume2/docker/x-auto-download/videos:/downloads/videos
+```
+
+容器内部结构：
+
+```text
+/downloads/images      图片，以及 X 动图转出来的 GIF，全部平铺
+/downloads/videos      普通视频，全部平铺
+/downloads/_metadata   yt-dlp info.json 等元数据
+/downloads/_thumbnails 视频缩略图
+/downloads/_browser    最近一次 likes 页面截图
+/downloads/_tmp        下载临时目录
+```
+
+如果你想把图片和视频放到不同位置，只改这两行：
+
+```yaml
+  - /volume2/你的图片目录:/downloads/images
+  - /volume2/你的视频目录:/downloads/videos
+```
 
 ## Cookie
 
 推荐从电脑浏览器导出 Netscape 格式 `cookies.txt`，然后在网页端粘贴保存。
 
-保存后容器内路径是：
+保存后容器内路径：
 
 ```text
 /config/x_cookies.txt
 ```
 
-也可以直接把文件放到 NAS：
+也可以直接放到：
 
 ```text
-/volume1/docker/x-auto-download/config/x_cookies.txt
+/volume2/docker/x-auto-download/config/x_cookies.txt
 ```
 
 ## 停止标记
 
-默认停止标记是：
+默认停止标记：
 
 ```text
 https://x.com/deskt3d/status/1992264334853165368?s=20
@@ -77,59 +122,12 @@ https://x.com/deskt3d/status/1992264334853165368?s=20
 
 第一次运行会一直滚动 likes 页面，直到找到这个推文；找到后只下载它上方的新点赞内容，不下载标记本身。
 
-如果标记不存在或页面无法继续加载，程序会在连续多次没有新增内容后停止，避免无限循环。
+## 功能
 
-## 账号风险控制
-
-这个项目不调用点赞、关注、发帖等修改账号状态的操作，只读取你自己的网页 likes 页面。
-
-默认行为：
-
-- 12 小时运行一次；
-- 单浏览器、单线程；
-- 滚动距离随机；
-- 每次滚动后随机等待；
-- 每隔一段滚动随机长暂停；
-- 下载任务不并发；
-- 失败不会疯狂重试。
-
-## 本地测试
-
-```bash
-python -m pip install -r requirements.txt
-python x_auto_worker.py --config config/config.json
-```
-
-浏览器打开：
-
-```text
-http://127.0.0.1:8080
-```
-
-手动运行一次：
-
-```bash
-python x_auto_worker.py --config config/config.json --run-once
-```
-
-## 目录
-
-```text
-/config   配置和 cookie
-/state    SQLite 数据库
-/downloads 下载结果
-```
-
-下载文件结构：
-
-```text
-/downloads
-  /images       图片，以及 X 动图转出来的 GIF，全部平铺在这里
-  /videos       普通视频，全部平铺在这里
-  /_metadata    yt-dlp info.json 等元数据
-  /_thumbnails  视频缩略图
-  /_browser     最近一次 likes 页面截图
-  /_tmp         下载临时目录
-```
-
-图片和视频目录里不再按作者或 tweet id 分文件夹。
+- 网页端管理配置和 cookie。
+- 用无头浏览器打开 X likes 页面并滚动收集推文链接。
+- SQLite 记录已发现和已下载推文，避免重复下载。
+- 图片优先尝试高质量 CDN 候选。
+- 视频使用 `yt-dlp -f "bv*+ba/b"` 下载最高可用版本。
+- X 动图先用 `yt-dlp` 获取最高 mp4，再默认转成 GIF，按图片归类。
+- 默认 12 小时运行一次，单线程、随机滚动等待、无并发。
