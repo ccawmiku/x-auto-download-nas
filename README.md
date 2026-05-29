@@ -12,7 +12,8 @@
   - `{media_id}.png?name=4096x4096`
   - `{media_id}.jpg?name=4096x4096`
   - `?format=jpg&name=orig`
-- 视频和 X 动图使用 `yt-dlp -f "bv*+ba/b"` 下载最高可用版本。
+- 视频使用 `yt-dlp -f "bv*+ba/b"` 下载最高可用版本。
+- X 动图先用 `yt-dlp` 获取最高 mp4，再默认转成 GIF，按图片归类。
 - 默认 12 小时运行一次，单线程、随机滚动等待、无并发。
 
 ## NAS 部署
@@ -25,9 +26,20 @@ mkdir -p /volume1/docker/x-auto-download/state
 mkdir -p /volume1/docker/x-auto-download/downloads
 ```
 
-复制本仓库到 NAS 后运行：
+从 GitHub 拉取后运行：
 
 ```bash
+cd /volume1/docker
+git clone https://github.com/你的用户名/你的仓库名.git x-auto-download-app
+cd x-auto-download-app
+docker compose up -d --build
+```
+
+如果已经 clone 过，更新代码：
+
+```bash
+cd /volume1/docker/x-auto-download-app
+git pull
 docker compose up -d --build
 ```
 
@@ -108,4 +120,16 @@ python x_auto_worker.py --config config/config.json --run-once
 /downloads 下载结果
 ```
 
-下载文件按作者和 tweet id 分目录保存。
+下载文件结构：
+
+```text
+/downloads
+  /images       图片，以及 X 动图转出来的 GIF，全部平铺在这里
+  /videos       普通视频，全部平铺在这里
+  /_metadata    yt-dlp info.json 等元数据
+  /_thumbnails  视频缩略图
+  /_browser     最近一次 likes 页面截图
+  /_tmp         下载临时目录
+```
+
+图片和视频目录里不再按作者或 tweet id 分文件夹。

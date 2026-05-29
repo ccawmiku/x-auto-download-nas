@@ -29,7 +29,7 @@
   },
   "media": {
     "video_format": "bv*+ba/b",
-    "convert_gif": false,
+    "convert_gif": true,
     "image_candidates": [
       "{media_id}.png?name=4096x4096",
       "{media_id}.jpg?name=4096x4096",

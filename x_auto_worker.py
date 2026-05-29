@@ -69,7 +69,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "media": {
         "video_format": "bv*+ba/b",
-        "convert_gif": False,
+        "convert_gif": True,
         "image_candidates": [
             "{media_id}.png?name=4096x4096",
             "{media_id}.jpg?name=4096x4096",
@@ -566,11 +566,35 @@ class Downloader:
         self.store = store
         self.log = log
 
-    def _tweet_dir(self, item: dict[str, Any]) -> Path:
-        safe_author = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.get("author") or "unknown")
-        path = Path(self.config["download_dir"]) / safe_author / item["tweet_id"]
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+    def _media_dirs(self) -> dict[str, Path]:
+        root = Path(self.config["download_dir"])
+        dirs = {
+            "images": root / "images",
+            "videos": root / "videos",
+            "metadata": root / "_metadata",
+            "thumbnails": root / "_thumbnails",
+            "tmp": root / "_tmp",
+        }
+        for path in dirs.values():
+            path.mkdir(parents=True, exist_ok=True)
+        return dirs
+
+    def _safe_stem(self, item: dict[str, Any], suffix: str = "") -> str:
+        author = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.get("author") or "unknown").strip("_")
+        author = author or "unknown"
+        stem = f"{item['tweet_id']}_{author}"
+        if suffix:
+            stem = f"{stem}_{suffix}"
+        return stem[:180]
+
+    def _unique_path(self, path: Path) -> Path:
+        if not path.exists():
+            return path
+        for index in range(2, 10000):
+            candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+        raise RuntimeError(f"could not find unique filename for {path}")
 
     def _image_candidates(self, media_id: str) -> list[tuple[str, str]]:
         patterns = self.config.get("media", {}).get("image_candidates") or DEFAULT_CONFIG["media"]["image_candidates"]
@@ -602,11 +626,11 @@ class Downloader:
         files = []
         if not media_ids:
             return files
-        out_dir = self._tweet_dir(item)
+        out_dir = self._media_dirs()["images"]
         for index, media_id in enumerate(media_ids, start=1):
             done = False
             for candidate, ext in self._image_candidates(media_id):
-                target = out_dir / f"{item['tweet_id']}_{index}_{media_id}.{ext}"
+                target = out_dir / f"{self._safe_stem(item, f'{index}_{media_id}')}.{ext}"
                 if target.exists() and target.stat().st_size > 0:
                     files.append(str(target))
                     done = True
@@ -626,8 +650,11 @@ class Downloader:
     def download_video(self, item: dict[str, Any]) -> list[str]:
         if not item.get("has_video"):
             return []
-        out_dir = self._tweet_dir(item)
-        before = {p.resolve() for p in out_dir.glob("*")}
+        dirs = self._media_dirs()
+        tmp_dir = dirs["tmp"] / item["tweet_id"]
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         command = [
             "yt-dlp",
             "--cookies",
@@ -640,18 +667,102 @@ class Downloader:
             "--write-thumbnail",
             "--no-overwrites",
             "-o",
-            str(out_dir / "%(uploader_id)s_%(id)s.%(ext)s"),
+            str(tmp_dir / "%(uploader_id)s_%(id)s.%(ext)s"),
             item["url"],
         ]
         self.log.write(f"yt-dlp: {item['url']}")
         result = subprocess.run(command, capture_output=True, text=True, timeout=900)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout)[-2000:])
-        after = {p.resolve() for p in out_dir.glob("*")}
-        files = [str(p) for p in sorted(after - before) if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".jpg", ".png", ".json"}]
-        if not files:
-            files = [str(p) for p in sorted(out_dir.glob("*")) if p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
+        media_files = [
+            p for p in tmp_dir.glob("*")
+            if p.suffix.lower() in {".mp4", ".mkv", ".webm"}
+        ]
+        if not media_files:
+            return []
+        info_files = list(tmp_dir.glob("*.info.json"))
+        is_gif = self._looks_like_x_gif(info_files)
+        files: list[str] = []
+        for index, media_file in enumerate(media_files, start=1):
+            if is_gif:
+                gif_target = self._unique_path(
+                    dirs["images"] / f"{self._safe_stem(item, f'gif_{index}')}.gif"
+                )
+                if self.config.get("media", {}).get("convert_gif", True):
+                    converted = self._convert_mp4_to_gif(media_file, gif_target)
+                    if converted:
+                        files.append(str(gif_target))
+                        continue
+                fallback = self._unique_path(
+                    dirs["images"] / f"{self._safe_stem(item, f'gif_{index}')}{media_file.suffix}"
+                )
+                shutil.move(str(media_file), fallback)
+                files.append(str(fallback))
+            else:
+                target = self._unique_path(
+                    dirs["videos"] / f"{self._safe_stem(item, str(index))}{media_file.suffix}"
+                )
+                shutil.move(str(media_file), target)
+                files.append(str(target))
+        self._move_sidecars(tmp_dir, item)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return files
+
+    def _looks_like_x_gif(self, info_files: list[Path]) -> bool:
+        for info_file in info_files:
+            try:
+                data = json.loads(info_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            title = str(data.get("title") or data.get("fulltitle") or "").lower()
+            if ".gif" in title:
+                return True
+            for key in ("url", "thumbnail"):
+                if "/tweet_video" in str(data.get(key) or ""):
+                    return True
+            for fmt in data.get("formats") or []:
+                if "/tweet_video" in str(fmt.get("url") or ""):
+                    return True
+        return False
+
+    def _convert_mp4_to_gif(self, source: Path, target: Path) -> bool:
+        if not shutil.which("ffmpeg"):
+            self.log.write("ffmpeg not found; keeping X GIF as mp4 fallback")
+            return False
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            "fps=15,scale=iw:-1:flags=lanczos",
+            "-loop",
+            "0",
+            str(target),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+        if result.returncode != 0 or not target.exists() or target.stat().st_size <= 0:
+            self.log.write(f"GIF conversion failed: {(result.stderr or result.stdout)[-1000:]}")
+            return False
+        try:
+            source.unlink()
+        except OSError:
+            pass
+        self.log.write(f"GIF converted: {target.name}")
+        return True
+
+    def _move_sidecars(self, tmp_dir: Path, item: dict[str, Any]) -> None:
+        dirs = self._media_dirs()
+        for path in tmp_dir.glob("*"):
+            suffix = path.suffix.lower()
+            if suffix == ".json":
+                target_dir = dirs["metadata"]
+            elif suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+                target_dir = dirs["thumbnails"]
+            else:
+                continue
+            target = self._unique_path(target_dir / f"{self._safe_stem(item)}_{path.name}")
+            shutil.move(str(path), target)
 
     def download_item(self, item: dict[str, Any]) -> tuple[str, list[str], str]:
         tweet_id = item["tweet_id"]
