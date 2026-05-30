@@ -19,10 +19,10 @@ GitHub 仓库 -> Actions -> Docker Image CI
 等待任务成功，镜像会发布到：
 
 ```text
-ghcr.io/ccawmiku/x-auto-download-nas:1.0.1
+ghcr.io/ccawmiku/x-auto-download-nas:1.0.2
 ```
 
-这里不用 `latest`，compose 固定使用明确版本。以后升级时，先改 `docker-compose.yml` 里的镜像版本，再打对应 git tag，例如 `v1.0.2`。
+这里不用 `latest`，compose 固定使用明确版本。以后升级时，先改 `docker-compose.yml` 里的镜像版本，再打对应 git tag，例如 `v1.0.3`。
 
 如果 GHCR package 是 private，NAS 拉镜像前需要登录：
 
@@ -112,6 +112,12 @@ volumes:
 /volume2/docker/x-auto-download/config/x_cookies.txt
 ```
 
+网页端保存后会显示 Cookie 检查结果：数量、`auth_token`、`ct0`、`twid` 是否存在。也可以粘贴一条推文 URL 点“测试 Cookie / yt-dlp”，日志里会显示 yt-dlp 是否能用容器内这份 Cookie 解析出视频格式。
+
+## 手动单条下载
+
+网页端有“手动单条下载”。粘贴推文 URL 后，会先用无头浏览器打开单条推文识别图片/视频，再强制重新下载这一条。这个功能适合测试有问题的视频，也适合处理自动列表里标成“需手动检查”的条目。
+
 ## 停止标记
 
 默认停止标记：
@@ -129,8 +135,9 @@ https://x.com/deskt3d/status/1992264334853165368?s=20
 - SQLite 记录已发现和已下载推文，避免重复下载。
 - 图片优先尝试高质量 CDN 候选。
 - 视频使用 `yt-dlp -f "bv*+ba/b"` 下载最高可用版本。
-- X 动图先用 `yt-dlp` 获取最高 mp4，再默认转成 GIF，按图片归类。
+- X 动图只在资源来自 `tweet_video` 时按 GIF 处理；普通视频不会因为账号名或标题里带 `.gif` 被误转成 GIF。
 - 默认 12 小时运行一次，单线程、随机滚动等待、无并发。
 - 下载是严格一条推文一条推文顺序执行，不会并发下载。
 - 停止标记只比较 tweet 数字 ID；`x.com`/`twitter.com`、用户名、`?s=20` 这类参数不同都不影响。
 - 日常运行不需要每次翻到停止标记；默认连续遇到 10 条已下载推文就停止继续向后翻。
+- 网页端会显示本地图片/视频文件数量，下载记录里也会显示每条记录的文件数。

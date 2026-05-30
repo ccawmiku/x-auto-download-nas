@@ -1,4 +1,5 @@
 {
+  "run_interval_hours": 12,
   "run_interval_seconds": 43200,
   "database": "/state/x_auto.sqlite3",
   "cookie_file": "/config/x_cookies.txt",
