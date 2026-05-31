@@ -59,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "browser": {
         "enabled": True,
         "headless": True,
+        "screen_name": "",
         "likes_url": "",
         "scroll_delay_min_ms": 1500,
         "scroll_delay_max_ms": 4000,
@@ -613,12 +614,38 @@ class BrowserCollector:
 
     async def _resolve_screen_name(self, page: Any, user_id: str) -> str:
         timeout = int(self.config["browser"].get("target_timeout_ms", 45000))
-        await page.goto(f"https://x.com/i/user/{user_id}", wait_until="domcontentloaded", timeout=timeout)
-        await page.wait_for_timeout(random.randint(2500, 4200))
+        for url in (f"https://x.com/i/user/{user_id}", "https://x.com/home"):
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await page.wait_for_timeout(random.randint(2500, 4200))
+            screen_name = await self._screen_name_from_page(page)
+            if screen_name:
+                return screen_name
+        raise RuntimeError("could not resolve current X screen name from cookie; set browser.screen_name or browser.likes_url")
+
+    async def _screen_name_from_page(self, page: Any) -> str:
         match = re.match(r"https://x\.com/([^/?#]+)", page.url)
         if match and match.group(1) not in {"i", "home", "login"}:
             return match.group(1)
-        raise RuntimeError("could not resolve current X screen name from cookie")
+        value = await page.evaluate(
+            """() => {
+              const reserved = new Set([
+                "home", "i", "login", "explore", "notifications", "messages",
+                "settings", "compose", "search", "jobs", "premium", "verified_orgs"
+              ]);
+              const profile = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
+              const candidates = [];
+              if (profile) candidates.push(profile.getAttribute("href") || "");
+              for (const a of document.querySelectorAll('a[href^="/"]')) {
+                candidates.push(a.getAttribute("href") || "");
+              }
+              for (const href of candidates) {
+                const match = href.match(/^\\/([A-Za-z0-9_]{1,15})(?:\\?|#|\\/)?$/);
+                if (match && !reserved.has(match[1])) return match[1];
+              }
+              return "";
+            }"""
+        )
+        return str(value or "")
 
     async def _collect_visible(self, page: Any) -> list[dict[str, Any]]:
         return await page.evaluate(
@@ -714,9 +741,12 @@ class BrowserCollector:
                 likes_url = str(browser_cfg.get("likes_url") or "").strip()
                 if likes_url:
                     screen_name = urlparse(likes_url).path.strip("/").split("/")[0]
+                elif str(browser_cfg.get("screen_name") or "").strip():
+                    screen_name = str(browser_cfg.get("screen_name") or "").strip().lstrip("@")
+                    likes_url = f"https://x.com/{screen_name}/likes"
                 else:
                     if not user_id:
-                        raise RuntimeError("twid cookie not found; set browser.likes_url manually")
+                        raise RuntimeError("twid cookie not found; set browser.screen_name or browser.likes_url manually")
                     screen_name = await self._resolve_screen_name(page, user_id)
                     likes_url = f"https://x.com/{screen_name}/likes"
 
@@ -1488,7 +1518,8 @@ def html_page(app: App) -> str:
       <h2>配置</h2>
       <form method="post" action="/settings">
         <div class="grid">
-          <div><label>Likes 页面 URL（留空自动使用当前账号）</label><input id="likesUrlInput" name="likes_url"></div>
+          <div><label>X 用户名（不带 @；Likes URL 为空时使用）</label><input id="screenNameInput" name="screen_name"></div>
+          <div><label>Likes 页面 URL（留空优先使用 X 用户名）</label><input id="likesUrlInput" name="likes_url"></div>
           <div><label>停止标记 URL</label><input id="stopUrlInput" name="stop_url"></div>
           <div><label>运行间隔（小时）</label><input id="intervalHoursInput" name="interval_hours" type="number" min="0.1" step="0.1"></div>
           <div><label>最大滚动次数（0 表示直到标记或页面无新增）</label><input id="maxScrollsInput" name="max_scrolls" type="number" min="0" step="1"></div>
@@ -1569,6 +1600,7 @@ def html_page(app: App) -> str:
     function fillFormOnce(data) {
       if (filledForm) return;
       const cfg = data.config || {};
+      $("screenNameInput").value = cfg.browser?.screen_name || "";
       $("likesUrlInput").value = cfg.browser?.likes_url || "";
       $("stopUrlInput").value = cfg.stop_marker?.url || "";
       $("intervalHoursInput").value = data.run_interval_hours || cfg.run_interval_hours || 12;
@@ -1673,6 +1705,7 @@ def make_handler(app: App):
                     "known_stop_consecutive": int((form.get("known_stop_consecutive") or ["10"])[0] or 10),
                     "stop_marker": {"url": (form.get("stop_url") or [""])[0]},
                     "browser": {
+                        "screen_name": (form.get("screen_name") or [""])[0].strip().lstrip("@"),
                         "likes_url": (form.get("likes_url") or [""])[0],
                         "max_scrolls": int((form.get("max_scrolls") or ["0"])[0] or 0),
                     },

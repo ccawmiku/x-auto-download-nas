@@ -19,7 +19,7 @@ GitHub 仓库 -> Actions -> Docker Image CI
 等待任务成功，镜像会发布到：
 
 ```text
-ghcr.io/ccawmiku/x-auto-download-nas:1.0.2
+ghcr.io/ccawmiku/x-auto-download-nas:1.0.3
 ```
 
 这里不用 `latest`，compose 固定使用明确版本。以后升级时，先改 `docker-compose.yml` 里的镜像版本，再打对应 git tag，例如 `v1.0.3`。

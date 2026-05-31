@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   x-auto-downloader:
-    image: ghcr.io/ccawmiku/x-auto-download-nas:1.0.2
+    image: ghcr.io/ccawmiku/x-auto-download-nas:1.0.3
     container_name: x-auto-downloader
     ports:
       - "13003:8080"

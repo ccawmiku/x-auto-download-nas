@@ -17,6 +17,7 @@
   "browser": {
     "enabled": true,
     "headless": true,
+    "screen_name": "",
     "likes_url": "",
     "scroll_delay_min_ms": 1500,
     "scroll_delay_max_ms": 4000,
