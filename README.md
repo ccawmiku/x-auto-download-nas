@@ -1,6 +1,6 @@
-# X Auto Downloader NAS
+# X 点赞媒体 NAS 自动下载器
 
-基于 `Playwright + yt-dlp` 的 X 点赞媒体自动下载器，目标是在 NAS Docker 上低频运行。
+基于 `Playwright + yt-dlp` 的 X 点赞媒体自动下载器，面向 NAS Docker 的低频、单线程运行场景。它会记录已发现和已下载的推文，减少重复抓取，并把图片、视频与元数据分目录保存。
 
 ## 生成 Docker 镜像
 
